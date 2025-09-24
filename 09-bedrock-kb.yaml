@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Creates the Bedrock Knowledge Base from a hardcoded list of web URL data sources, 
+  including the S3 bucket for ingested content, OpenSearch Serverless vector store, and necessary IAM roles.
+
+Resources:
+  # 1. S3 Bucket for Bedrock to STORE the ingested web content
+  KnowledgeBaseIngestionBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'ai-email-kb-ingestion-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # 2. OpenSearch Serverless Collection (Vector Store)
+  # OpenSearchEncryptionPolicy:
+  #   Type: AWS::OpenSearchServerless::SecurityPolicy
+  #   Properties:
+  #     Name: 'ai-email-kb-encryption-policy'
+  #     Policy: !Sub |
+  #       {
+  #         "Rules": [
+  #           {
+  #             "Resource": ["collection/ai-email-kb-vector-store"],
+  #             "ResourceType": "collection"
+  #           }
+  #         ],
+  #         "AWSOwnedKey": true
+  #       }
+  #     Type: 'encryption'
+
+  # OpenSearchNetworkPolicy:
+  #   Type: AWS::OpenSearchServerless::SecurityPolicy
+  #   Properties:
+  #     Name: 'ai-email-kb-network-policy'
+  #     Policy: !Sub |
+  #       [
+  #         {
+  #           "Rules": [
+  #             {
+  #               "Resource": ["collection/ai-email-kb-vector-store"],
+  #               "ResourceType": "collection"
+  #             }
+  #           ],
+  #           "AllowFromPublic": true
+  #         }
+  #       ]
+  #     Type: 'network'
+
+  # OpenSearchAccessPolicy:
+  #   Type: AWS::OpenSearchServerless::AccessPolicy
+  #   Properties:
+  #     Name: 'ai-email-kb-access-policy'
+  #     Policy: !Sub |
+  #       [
+  #         {
+  #           "Rules": [
+  #             {
+  #               "Resource": ["collection/ai-email-kb-vector-store"],
+  #               "Permission": [
+  #                 "aoss:CreateCollectionItems",
+  #                 "aoss:DeleteCollectionItems",
+  #                 "aoss:UpdateCollectionItems",
+  #                 "aoss:DescribeCollectionItems"
+  #               ],
+  #               "ResourceType": "collection"
+  #             },
+  #             {
+  #               "Resource": ["index/ai-email-kb-vector-store/*"],
+  #               "Permission": [
+  #                 "aoss:CreateIndex",
+  #                 "aoss:DeleteIndex",
+  #                 "aoss:UpdateIndex",
+  #                 "aoss:DescribeIndex",
+  #                 "aoss:ReadDocument",
+  #                 "aoss:WriteDocument"
+  #               ],
+  #               "ResourceType": "index"
+  #             }
+  #           ],
+  #           "Principal": [
+  #             "arn:aws:iam::${AWS::AccountId}:role/ai-email-demo-bedrock-kb-role-${AWS::AccountId}-${AWS::Region}"
+  #           ]
+  #         }
+  #       ]
+  #     Type: 'data'
+  #   DependsOn: BedrockKnowledgeBaseRole
+
+  # OpenSearchCollection:
+  #   Type: AWS::OpenSearchServerless::Collection
+  #   Properties:
+  #     Name: 'ai-email-kb-vector-store'
+  #     Type: 'VECTORSEARCH'
+  #   DependsOn:
+  #     - OpenSearchEncryptionPolicy
+  #     - OpenSearchNetworkPolicy
+  #     - OpenSearchAccessPolicy
+
+  # 3. IAM Role for the Knowledge Base
+  BedrockKnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ai-email-demo-bedrock-kb-role-${AWS::AccountId}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Bedrock-KB-S3-Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:ListBucket"]
+                Resource:
+                  - !GetAtt KnowledgeBaseIngestionBucket.Arn
+                  - !Sub '${KnowledgeBaseIngestionBucket.Arn}/*'
+        - PolicyName: Bedrock-KB-Bedrock-Model-Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: "bedrock:InvokeModel"
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v1'
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0'
+              - Effect: Allow
+                Action: bedrock:Retrieve
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*'
+              - Effect: Allow
+                Action: bedrock:RetrieveAndGenerate
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*'
+              # NEW PERMISSION: Allow this role to send emails via SES for the reply.
+              - Effect: Allow
+                Action: ses:SendEmail
+                Resource: '*' # For this demo, we allow sending to any recipient.
+        - PolicyName: Bedrock-KB-OpenSearch-Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - "aoss:APIAccessAll"
+                  - "aoss:DashboardsAccessAll"
+                Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+        - PolicyName: Bedrock-KB-Bedrock-Model-Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: "bedrock:InvokeModel"
+                # CORRECTED: This now points to the v2 model required for syncing.
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0'
+
+
+#   # 4. The Bedrock Knowledge Base Itself
+#   MyKnowledgeBase:
+#     Type: AWS::Bedrock::KnowledgeBase
+#     Properties:
+#       Name: !Sub 'Customer-FAQ-Knowledge-Base-${AWS::AccountId}'
+#       RoleArn: !GetAtt BedrockKnowledgeBaseRole.Arn
+#       KnowledgeBaseConfiguration:
+#         Type: "VECTOR"
+#         VectorKnowledgeBaseConfiguration:
+#           EmbeddingModelArn: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v1'
+#       StorageConfiguration:
+#         Type: "OPENSEARCH_SERVERLESS"
+#         OpensearchServerlessConfiguration:
+#           CollectionArn: !GetAtt OpenSearchCollection.Arn
+#           VectorIndexName: "bedrock-knowledge-base-default-index"
+#     DependsOn: 
+#       - BedrockKnowledgeBaseRole
+#       - OpenSearchCollection
+#       - OpenSearchAccessPolicy
+
+#   MyDataSource:
+#     Type: AWS::Bedrock::DataSource
+#     Properties:
+#       KnowledgeBaseId: !Ref MyKnowledgeBase
+#       Name: "Website-FAQ-Data-Source"
+#       DataSourceConfiguration:
+#         Type: "WEB"
+#         WebConfiguration:
+#           CrawlerConfiguration:
+#             CrawlerLimits:
+#               RateLimit: 300
+#             InclusionFilters:
+#               - 'https://en.wikipedia.org/wiki/Insurance'
+#               - 'https://en.wikipedia.org/wiki/Sales'
+#       VectorIngestionConfiguration:
+#         ChunkingConfiguration:
+#           ChunkingStrategy: "FIXED_SIZE"
+#           FixedSizeChunkingConfiguration:
+#             MaxTokens: 512
+#             OverlapPercentage: 20
+#     DependsOn: MyKnowledgeBase
+
+# Outputs:
+#   KnowledgeBaseId:
+#     Description: The ID of the created Bedrock Knowledge Base.
+#     Value: !Ref MyKnowledgeBase
+#   KnowledgeBaseArn:
+#     Description: The ARN of the created Bedrock Knowledge Base.
+#     Value: !GetAtt MyKnowledgeBase.KnowledgeBaseArn

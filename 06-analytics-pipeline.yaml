@@ -1,0 +1,173 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  This stack creates the data pipeline for the QuickSight dashboard. It includes a Lambda 
+  function to process DynamoDB stream events, transform the data, and store it in a 
+  new S3 bucket optimized for analytics with Amazon Athena.
+
+Parameters:
+  DynamoDbStreamArn:
+    Type: String
+    Description: The full ARN of the DynamoDB stream from your 'ai-email-demo-results' table.
+
+Resources:
+  # 1. S3 Bucket to store the processed data for analytics
+  AnalyticsS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'ai-email-analytics-data-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldAnalyticsData
+            Status: Enabled
+            ExpirationInDays: 365
+
+  # 2. IAM Role for the data transformation Lambda function
+  DataPipelineLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoStreamAndS3Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ai-email-data-transformer-*:*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource: !Ref DynamoDbStreamArn
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${AnalyticsS3Bucket.Arn}/*'
+
+  # 3. The Lambda function that transforms the data
+  DataPipelineLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'ai-email-data-transformer-${AWS::AccountId}'
+      Handler: index.handler
+      Role: !GetAtt DataPipelineLambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          ANALYTICS_BUCKET_NAME: !Ref AnalyticsS3Bucket
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime
+          from boto3.dynamodb.types import TypeDeserializer
+          # FIX: Import the Decimal type to handle it
+          from decimal import Decimal
+
+          s3_client = boto3.client('s3')
+          ANALYTICS_BUCKET = os.environ['ANALYTICS_BUCKET_NAME']
+          deserializer = TypeDeserializer()
+
+          # FIX: Create a helper class to convert Decimals to int/float for JSON serialization
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      # Check if it's a whole number
+                      if obj % 1 == 0:
+                          return int(obj)
+                      else:
+                          return float(obj)
+                  # Let the base class default method raise the TypeError
+                  return super(DecimalEncoder, self).default(obj)
+
+          def flatten_json(y):
+              out = {}
+              def flatten(x, name=''):
+                  if type(x) is dict:
+                      for a in x:
+                          flatten(x[a], name + a + '_')
+                  elif type(x) is list:
+                      i = 0
+                      for a in x:
+                          flatten(a, name + str(i) + '_')
+                          i += 1
+                  else:
+                      out[name[:-1]] = x
+              flatten(y)
+              return out
+
+          def handler(event, context):
+              print(f"Received {len(event['Records'])} records from DynamoDB stream.")
+              
+              for record in event['Records']:
+                  if record['eventName'] in ['INSERT', 'MODIFY']:
+                      try:
+                          new_image_ddb = record['dynamodb']['NewImage']
+                          python_data = {k: deserializer.deserialize(v) for k, v in new_image_ddb.items()}
+
+                          if 'analysis' in python_data and python_data.get('analysis'):
+                              flattened_data = flatten_json(python_data)
+                              
+                              timestamp_str = flattened_data.get('receivedTimestamp')
+                              timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00')) if timestamp_str else datetime.utcnow()
+
+                              s3_key_prefix = (
+                                  f"processed-data/year={timestamp.year}/"
+                                  f"month={timestamp.month:02d}/"
+                                  f"day={timestamp.day:02d}/"
+                              )
+                              
+                              message_id = str(flattened_data.get('messageId', context.aws_request_id)).replace('/', '_').replace(':', '_').replace('<','').replace('>','')
+                              file_name = f"{message_id}.json"
+                              s3_key = f"{s3_key_prefix}{file_name}"
+
+                              s3_client.put_object(
+                                  Bucket=ANALYTICS_BUCKET,
+                                  Key=s3_key,
+                                  # FIX: Use the custom DecimalEncoder in the dumps call
+                                  Body=json.dumps(flattened_data, cls=DecimalEncoder),
+                                  ContentType='application/json'
+                              )
+                              print(f"Successfully processed and stored record: {s3_key}")
+
+                      except Exception as e:
+                          print(f"Error processing record: {record.get('dynamodb', {}).get('Keys')}. Error: {e}")
+              
+              return {'statusCode': 200, 'body': json.dumps('Processing complete')}
+
+  # 4. The trigger that connects the DynamoDB Stream to the Lambda function
+  DynamoStreamEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref DynamoDbStreamArn
+      FunctionName: !GetAtt DataPipelineLambda.Arn
+      StartingPosition: LATEST
+      BatchSize: 100
+
+Outputs:
+  AnalyticsS3BucketName:
+    Description: "The S3 bucket where transformed analytics data is stored. Use this for the Glue Crawler."
+    Value: !Ref AnalyticsS3Bucket
+

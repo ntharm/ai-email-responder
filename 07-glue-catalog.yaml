@@ -1,0 +1,82 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  This stack creates the AWS Glue Data Catalog resources. It deploys a Glue Database 
+  and a Crawler that automatically scans the analytics S3 bucket, infers the schema 
+  of the email data, and creates a table that can be queried by Amazon Athena.
+
+Parameters:
+  AnalyticsS3BucketName:
+    Type: String
+    Description: The name of the S3 bucket containing the transformed JSON data from the analytics pipeline.
+
+Resources:
+  # 1. A Database to hold our table metadata in the Glue Data Catalog
+  AnalyticsDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: ai_email_analytics_db
+        Description: Database for storing metadata of the AI email analysis results.
+
+  # 2. An IAM Role that grants the Glue Crawler permission to access the S3 bucket
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3AccessForGlueCrawler
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${AnalyticsS3BucketName}'
+                  - !Sub 'arn:aws:s3:::${AnalyticsS3BucketName}/*'
+
+  # 3. The Glue Crawler that scans S3 and creates/updates the table
+  AnalyticsCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: AI-Email-Analytics-Crawler
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref AnalyticsDatabase
+      Description: Crawls the S3 bucket to catalog the transformed email analytics data.
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${AnalyticsS3BucketName}/processed-data/'
+      Configuration: >-
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": { "AddOrUpdateBehavior": "InheritFromTable" }
+          }
+        }
+      # CHANGE: This policy now tells the crawler to actively update the table.
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+      # This schedule runs the crawler at the top of every hour
+      Schedule:
+        ScheduleExpression: cron(0 * * * ? *)
+      TablePrefix: email_analytics_
+
+Outputs:
+  GlueDatabaseName:
+    Description: "The name of the Glue database created."
+    Value: !Ref AnalyticsDatabase
+  GlueCrawlerName:
+    Description: "The name of the Glue crawler. You can run this manually to catalog data immediately."
+    Value: !Ref AnalyticsCrawler
+

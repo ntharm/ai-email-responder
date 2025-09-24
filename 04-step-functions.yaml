@@ -1,0 +1,70 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploys the Step Functions State Machine, updated to use a single RAG Lambda for all inquiries.
+
+Parameters:
+  StepFunctionsExecutionRoleArn:
+    Type: String
+  # Note: The other Lambda ARNs are passed for structural consistency but are not used in this simplified workflow.
+  SimpleResponseLambdaArn:
+    Type: String
+  RagResponseLambdaArn:
+    Type: String
+  ClaimsAgentLambdaArn:
+    Type: String
+  # ADDED: This parameter is added for compatibility with the parent stack, even though it is not used in the state machine definition below.
+  EmailResponderLambdaArn:
+    Type: String
+
+Resources:
+  AIStateOrchestrator:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub 'AI-Email-Orchestrator-${AWS::AccountId}'
+      RoleArn: !Ref StepFunctionsExecutionRoleArn
+      DefinitionString: !Sub
+        - |-
+          {
+            "Comment": "A state machine that orchestrates email processing and sends intelligent RAG replies for all categories.",
+            "StartAt": "CategorizeEmail",
+            "States": {
+              "CategorizeEmail": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.analysis.domain",
+                    "StringEquals": "Sales",
+                    "Next": "GenerateAndSendRAGResponse"
+                  },
+                  {
+                    "Variable": "$.analysis.domain",
+                    "StringEquals": "Support",
+                    "Next": "GenerateAndSendRAGResponse"
+                  },
+                  {
+                    "Variable": "$.analysis.domain",
+                    "StringEquals": "Claims",
+                    "Next": "GenerateAndSendRAGResponse"
+                  }
+                ],
+                "Default": "GenerateAndSendRAGResponse"
+              },
+              "GenerateAndSendRAGResponse": {
+                "Comment": "For any category, invoke the RAG Lambda to query the KB and send an intelligent reply.",
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${RagResponseLambdaArn}",
+                  "Payload.$": "$"
+                },
+                "End": true
+              }
+            }
+          }
+        - {
+            RagResponseLambdaArn: !Ref RagResponseLambdaArn
+          }
+
+Outputs:
+  StateMachineArn:
+    Description: ARN of the Step Functions State Machine
+    Value: !Ref AIStateOrchestrator

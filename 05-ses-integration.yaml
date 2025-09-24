@@ -1,0 +1,34 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Configures Amazon SES to save incoming emails to an S3 bucket and activates the rule set.
+
+Parameters:
+  VerifiedEmail:
+    Type: String
+    Description: The verified email address that will receive demo emails.
+  EmailS3BucketName:
+    Type: String
+    Description: The name of the S3 bucket where emails will be stored.
+
+Resources:
+  SesRuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+    Properties:
+      RuleSetName: !Sub 'ai-email-demo-ruleset-${AWS::AccountId}'
+
+  SesRule:
+    Type: AWS::SES::ReceiptRule
+    Properties:
+      RuleSetName: !Ref SesRuleSet
+      Rule:
+        Name: AI-Email-Demo-Rule-S3-Only
+        Enabled: true
+        Recipients:
+          - !Ref VerifiedEmail
+        Actions:
+          - S3Action:
+              BucketName: !Ref EmailS3BucketName
+              ObjectKeyPrefix: incoming-emails/
+
+# The rule set is activated implicitly when the SesRule is created,
+# as long as no other rule set is currently active in the region.
+# The separate, incorrect "Activator" resource has been removed.

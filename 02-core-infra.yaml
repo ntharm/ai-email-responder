@@ -1,0 +1,87 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Creates the S3 bucket, DynamoDB table, and the S3-to-Lambda trigger.
+
+Parameters:
+  InitialProcessingLambdaArn:
+    Type: String
+    Description: The ARN of the Lambda function that will be triggered by S3.
+
+Resources:
+  # This permission MUST be created before the bucket tries to use it.
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InitialProcessingLambdaArn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      # We construct the ARN manually from a predictable bucket name to break the circular dependency.
+      SourceArn: !Sub 'arn:aws:s3:::ai-email-demo-emails-${AWS::AccountId}-${AWS::Region}'
+      SourceAccount: !Ref AWS::AccountId
+
+  EmailS3Bucket:
+    Type: AWS::S3::Bucket
+    # This explicit dependency ensures the permission exists before the trigger is configured.
+    DependsOn: S3InvokeLambdaPermission
+    Properties:
+      # We define a predictable, globally unique bucket name to use in the permission's SourceArn.
+      BucketName: !Sub 'ai-email-demo-emails-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldEmails
+            Status: Enabled
+            ExpirationInDays: 7
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !Ref InitialProcessingLambdaArn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming-emails/
+
+  EmailS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EmailS3Bucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowSESPuts
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub 'arn:aws:s3:::${EmailS3Bucket}/*'
+            Condition:
+              StringEquals:
+                'aws:Referer': !Ref AWS::AccountId
+
+  ResultsDynamoDbTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: messageId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: messageId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      TableName: !Sub 'ai-email-demo-results-${AWS::AccountId}'
+
+Outputs:
+  EmailS3BucketName:
+    Description: Name of the S3 bucket for storing emails.
+    Value: !Ref EmailS3Bucket
+  ResultsDynamoDbTableName:
+    Description: Name of the DynamoDB table for storing results.
+    Value: !Ref ResultsDynamoDbTable
+

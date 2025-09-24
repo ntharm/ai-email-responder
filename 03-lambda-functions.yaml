@@ -1,0 +1,362 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploys all Lambda functions, including the updated RAG responder that uses the Knowledge Base.
+
+Parameters:
+  LambdaExecutionRoleArn:
+    Type: String
+    Description: IAM role ARN assumed by all Lambdas in this stack.
+  EmailS3BucketName:
+    Type: String
+    Description: S3 bucket where inbound emails are stored.
+  ResultsDynamoDbTableName:
+    Type: String
+    Description: DynamoDB table to store processing results.
+  StateMachineArn:
+    Type: String
+    Description: ARN of the Step Functions state machine.
+  KnowledgeBaseId:
+    Type: String
+    Description: The ID of the Bedrock Knowledge Base to query for answers.
+  SourceEmailAddress:
+    Type: String
+    Description: The email address verified in SES for sending replies.
+
+Resources:
+
+  InitialProcessingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "ai-email-initial-processor-${AWS::AccountId}"
+      Handler: index.handler
+      Role: !Ref LambdaExecutionRoleArn
+      Runtime: python3.11
+      Timeout: 90
+      MemorySize: 256
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref ResultsDynamoDbTableName
+          STATE_MACHINE_ARN: !Ref StateMachineArn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import email
+          from email.policy import default
+          import datetime
+          import uuid
+          from decimal import Decimal
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      if obj % 1 == 0:
+                          return int(obj)
+                      else:
+                          return float(obj)
+                  return super(DecimalEncoder, self).default(obj)
+
+          s3 = boto3.client('s3')
+          dynamodb = boto3.client('dynamodb')
+          stepfunctions = boto3.client('stepfunctions')
+          bedrock_runtime = boto3.client('bedrock-runtime')
+
+          DYNAMODB_TABLE = os.environ['DYNAMODB_TABLE']
+          STATE_MACHINE_ARN = os.environ['STATE_MACHINE_ARN']
+
+          def clean_empty_strings(d):
+              if isinstance(d, dict):
+                  return {k: clean_empty_strings(v) for k, v in d.items() if v is not None and v != ''}
+              if isinstance(d, list):
+                  return [clean_empty_strings(i) for i in d if i is not None and i != '']
+              return d
+
+          def get_email_body(msg):
+              if msg.is_multipart():
+                  for part in msg.walk():
+                      ctype = part.get_content_type()
+                      cdispo = str(part.get('Content-Disposition'))
+                      if ctype == 'text/plain' and 'attachment' not in cdispo:
+                          return part.get_payload(decode=True).decode('utf-8', errors='ignore')
+              else:
+                  return msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+              return ""
+
+          def handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = event['Records'][0]['s3']['object']['key']
+
+              try:
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  email_content = response['Body'].read()
+
+                  msg = email.message_from_bytes(email_content, policy=default)
+
+                  subject = msg.get('Subject', 'No Subject')
+                  from_email = msg.get('From', 'No Sender')
+                  body = get_email_body(msg)
+                  message_id = msg.get('Message-ID', str(uuid.uuid4()))
+
+                  print(f"Processing email: From='{from_email}', Subject='{subject}'")
+
+                  system_prompt = (
+                      "You are an expert email analysis agent for a health insurance company. "
+                      "Your task is to analyze an email and return a structured JSON object. "
+                      'The JSON object must contain the keys: "domain", "intent", "sentiment", "summary", and "entities". '
+                      "Do not include any explanation or preamble in your response. Only return the JSON object.\n\n"
+                      "Here are the definitions for the domains. Be very precise.\n"
+                      '- "Sales": Use for any email from a prospective member asking for a quote, inquiring about different health plan options (e.g., PPO, HMO), coverage benefits, premiums, or how to enroll. This is for people who are NOT yet customers.\n'
+                      '- "Support": Use for any email from an existing member. This includes questions about their current plan benefits, help finding an in-network doctor, issues with the member portal or app (e.g., password reset), requests to update personal information (e.g., address change), or questions about an Explanation of Benefits (EOB) document. Assume the sender is an existing user unless the email explicitly suggests they are a new customer.\n'
+                      '- "Claims": Use for any email that is explicitly about submitting a new claim for a medical service, checking the status of a previously submitted claim, appealing a denied claim, or providing documentation (like a receipt or invoice) for a claim.\n'
+                      '- "General": Use for any other email, such as from a provider wanting to join the network, spam, newsletters, or general feedback that is not a specific support request.'
+                  )
+
+                  user_prompt_parts = [
+                      "Here are some examples to guide you:",
+                      "<example>",
+                      "Subject: Quote for family plan",
+                      "Body: Hi, I'd like to get a quote for myself, my spouse, and our two children.",
+                      'Output: {"domain": "Sales", "intent": "QuoteRequest", "sentiment": "Neutral", "summary": "A prospective customer is requesting a quote for a family health insurance plan.", "entities": {"plan_type": "family", "member_count": 4}}',
+                      "</example>",
+                      "<example>",
+                      "Subject: Can't see my EOB",
+                      "Body: I'm trying to log into the portal to see my latest explanation of benefits but it's not working. My member ID is HCA123456789.",
+                      'Output: {"domain": "Support", "intent": "PortalLoginIssue", "sentiment": "Negative", "summary": "An existing member cannot log into the portal to view their EOB.", "entities": {"member_id": "HCA123456789"}}',
+                      "</example>",
+                      "<example>",
+                      "Subject: Claim Status - Dr. Smith Visit 9/15",
+                      "Body: I submitted a claim for my visit with Dr. Smith last week and wanted to check on the status. The claim number is 20250915-A4B7.",
+                      'Output: {"domain": "Claims", "intent": "ClaimStatusInquiry", "sentiment": "Neutral", "summary": "An existing member is asking for a status update on a specific claim.", "entities": {"claim_number": "20250915-A4B7"}}',
+                      "</example>",
+                      "\nNow, analyze the following email:",
+                      f"<email>\nSubject: {subject}\nBody: {body}\n</email>",
+                  ]
+                  user_prompt = "\n".join(user_prompt_parts)
+
+                  bedrock_request_body = json.dumps({
+                      "anthropic_version": "bedrock-2023-05-31",
+                      "max_tokens": 1024,
+                      "system": system_prompt,
+                      "messages": [{"role": "user", "content": [{"type": "text", "text": user_prompt}]}]
+                  })
+
+                  bedrock_response = bedrock_runtime.invoke_model(
+                      body=bedrock_request_body,
+                      modelId='anthropic.claude-3-sonnet-20240229-v1:0',
+                      accept='application/json',
+                      contentType='application/json'
+                  )
+
+                  response_body_str = bedrock_response['body'].read().decode('utf-8')
+                  response_json = json.loads(response_body_str)
+                  analysis_str = response_json['content'][0]['text']
+                  analysis = json.loads(analysis_str)
+
+                  print(f"Bedrock analysis complete: {json.dumps(analysis)}")
+
+                  domain = analysis.get('domain', 'General')
+
+                  item_to_save = {
+                      'messageId': {'S': message_id},
+                      'receivedTimestamp': {'S': datetime.datetime.utcnow().isoformat()},
+                      'from': {'S': from_email},
+                      'subject': {'S': subject},
+                      'body': {'S': body},
+                      'status': {'S': f'Completed-{domain}'},
+                      'analysis': {'S': json.dumps(analysis)}
+                  }
+
+                  stepfunctions_input = {
+                      "messageId": message_id,
+                      "from": from_email,
+                      "subject": subject,
+                      "body": body,
+                      "analysis": analysis
+                  }
+
+                  stepfunctions.start_execution(
+                      stateMachineArn=STATE_MACHINE_ARN,
+                      input=json.dumps(stepfunctions_input, cls=DecimalEncoder)
+                  )
+
+                  sanitized_item = clean_empty_strings(item_to_save)
+                  dynamodb.put_item(TableName=DYNAMODB_TABLE, Item=sanitized_item)
+
+                  return {'statusCode': 200, 'body': json.dumps('Email processed successfully!')}
+
+              except Exception as e:
+                  print(f"Error processing email {key} from bucket {bucket}: {e}")
+                  error_item = {
+                      'messageId': {'S': key},
+                      'error': {'S': str(e)}
+                  }
+                  dynamodb.put_item(TableName=DYNAMODB_TABLE, Item=error_item)
+                  raise e
+
+  SimpleResponseLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "ai-email-simple-responder-${AWS::AccountId}"
+      Handler: index.handler
+      Role: !Ref LambdaExecutionRoleArn
+      Runtime: python3.11
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+
+          def handler(event, context):
+              print(f"Simple responder invoked with: {json.dumps(event)}")
+              return {"status": "Handled by simple responder"}
+
+  RagResponseLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "ai-email-rag-responder-${AWS::AccountId}"
+      Handler: index.handler
+      Role: !Ref LambdaExecutionRoleArn
+      Runtime: python3.11
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          KNOWLEDGE_BASE_ID: !Ref KnowledgeBaseId
+          SOURCE_EMAIL: !Ref SourceEmailAddress
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import re
+
+          bedrock_agent_runtime = boto3.client('bedrock-agent-runtime')
+          ses = boto3.client('ses')
+
+          KNOWLEDGE_BASE_ID = os.environ['KNOWLEDGE_BASE_ID']
+          SOURCE_EMAIL = os.environ['SOURCE_EMAIL']
+
+          def extract_email_address(from_header):
+              match = re.search(r'<(.+?)>', from_header)
+              if match:
+                  return match.group(1)
+              return from_header.strip()
+
+          def handler(event, context):
+              print(f"RAG responder invoked with: {json.dumps(event)}")
+
+              from_header = event.get('from')
+              if not from_header:
+                  print("No sender 'from' header found. Aborting.")
+                  return {"status": "Error", "reason": "No sender"}
+
+              original_sender = extract_email_address(from_header)
+              original_subject = event.get('subject', 'Your recent email')
+              question = event.get('body', '')
+              email_domain = event.get('analysis', {}).get('domain', 'General')
+
+              if not question:
+                  print("No email body found to use as a question. Aborting.")
+                  return {"status": "Error", "reason": "No question"}
+
+              try:
+                  response = bedrock_agent_runtime.retrieve_and_generate(
+                      input={'text': question},
+                      retrieveAndGenerateConfiguration={
+                          'type': 'KNOWLEDGE_BASE',
+                          'knowledgeBaseConfiguration': {
+                              'knowledgeBaseId': KNOWLEDGE_BASE_ID,
+                              'modelArn': f"arn:aws:bedrock:{os.environ.get('AWS_REGION', 'us-east-1')}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
+                          }
+                      }
+                  )
+
+                  generated_answer = response['output']['text']
+                  citations = response.get('citations', [])
+
+                  is_unhelpful_answer = (
+                      (not citations) or
+                      ("could not find an answer" in generated_answer.lower()) or
+                      ("do not have information" in generated_answer.lower())
+                  )
+
+                  reply_subject = f"Re: {original_subject}"
+
+                  if email_domain == "Sales":
+                      team_name = "The Sales Team"
+                  elif email_domain == "Support":
+                      team_name = "The Member Support Team"
+                  elif email_domain == "Claims":
+                      team_name = "The Claims Department"
+                  else:
+                      team_name = "Our Team"
+
+                  if is_unhelpful_answer:
+                      print("Knowledge Base did not provide a confident answer. Sending generic reply.")
+                      reply_body = (
+                          "Hello,\n"
+                          "Thank you for your inquiry.\n\n"
+                          "We are currently reviewing your question, and a member of our team will be in touch with you shortly.\n\n"
+                          f"Best regards,\n\n{team_name}\n"
+                      )
+                  else:
+                      print(f"Generated answer: {generated_answer}")
+                      parts = [
+                          "Hello,",
+                          "\nThank you for your question. Here is some information that might help:\n",
+                          generated_answer,
+                          "\nIf this does not fully answer your question, one of our agents will be in touch shortly.",
+                          "\nBest regards,\n",
+                          team_name
+                      ]
+                      if citations:
+                          parts.append("\n\nSource(s):")
+                          idx = 1
+                          for citation in citations:
+                              for reference in citation.get('retrievedReferences', []):
+                                  uri = reference.get('location', {}).get('uri', 'N/A')
+                                  parts.append(f"[{idx}] {uri}")
+                                  idx += 1
+                      reply_body = "\n".join(parts)
+
+                  ses.send_email(
+                      Source=SOURCE_EMAIL,
+                      Destination={'ToAddresses': [original_sender]},
+                      Message={
+                          'Subject': {'Data': reply_subject},
+                          'Body': {'Text': {'Data': reply_body}}
+                      }
+                  )
+                  print(f"Successfully sent RAG response to {original_sender}.")
+                  return {"status": "Success", "answer_sent": (not is_unhelpful_answer)}
+
+              except Exception as e:
+                  print(f"Error during RAG process or sending email: {str(e)}")
+                  raise e
+
+  ClaimsAgentLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "ai-email-claims-agent-${AWS::AccountId}"
+      Handler: index.handler
+      Role: !Ref LambdaExecutionRoleArn
+      Runtime: python3.11
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+
+          def handler(event, context):
+              print(f"Claims agent invoked with: {json.dumps(event)}")
+              return {"status": "Handled by claims agent"}
+
+Outputs:
+  InitialProcessingLambdaArn:
+    Value: !GetAtt InitialProcessingFunction.Arn
+  SimpleResponseLambdaArn:
+    Value: !GetAtt SimpleResponseLambda.Arn
+  RagResponseLambdaArn:
+    Value: !GetAtt RagResponseLambda.Arn
+  ClaimsAgentLambdaArn:
+    Value: !GetAtt ClaimsAgentLambda.Arn

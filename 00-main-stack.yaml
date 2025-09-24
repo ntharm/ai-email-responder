@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Main stack to deploy the AI Email Management Demo. This stack orchestrates the deployment 
+  of all the necessary resources by creating nested stacks for IAM, infrastructure, Lambda 
+  functions, Step Functions, and SES integration.
+
+Parameters:
+  TemplatesS3BucketName:
+    Type: String
+    Description: The name of the S3 bucket containing the nested CloudFormation templates (01-iam-roles.yaml, 02-core-infra.yaml, etc.).
+  VerifiedSesEmail:
+    Type: String
+    Description: The full email address you have verified in Amazon SES (e.g., demo@example.com). This is where you will send emails to trigger the demo.
+  DynamoDbStreamArn:
+    Type: String
+    Description: DynamoDB Stream ARN
+  FaqUrlForKnowledgeBase:
+    Type: CommaDelimitedList
+    Description: A comma-separated list of the full URLs to the FAQ/knowledge pages to be used as the data source.
+    Default: "https://en.wikipedia.org/wiki/Insurance,https://en.wikipedia.org/wiki/Sales,https://en.wikipedia.org/wiki/Technical_support"
+  SourceEmailAddress:
+    Type: String
+    Description: The reply email adress from
+    Default: tnilojan@gmail.com
+  KnowledgeBaseId:
+    Type: String
+    Description: KnowledgeBase ID
+    Default: HFEMQRULDX
+  
+
+Resources:
+  # Stack 1: Foundational IAM Roles
+  IamRolesStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplatesS3BucketName}.s3.${AWS::Region}.amazonaws.com/01-iam-roles.yaml"
+      TimeoutInMinutes: 5
+
+  # Stack 2: Lambda Functions (Must be created before Infra and StepFunctions to get its ARN)
+  LambdaFunctionsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplatesS3BucketName}.s3.${AWS::Region}.amazonaws.com/03-lambda-functions.yaml"
+      Parameters:
+        LambdaExecutionRoleArn: !GetAtt IamRolesStack.Outputs.LambdaExecutionRoleArn
+        ResultsDynamoDbTableName: !Sub 'ai-email-demo-results-${AWS::AccountId}'
+        StateMachineArn: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:AI-Email-Orchestrator-${AWS::AccountId}'
+        # FIX: Add the missing EmailS3BucketName parameter using the predictable name.
+        EmailS3BucketName: !Sub 'ai-email-demo-emails-${AWS::AccountId}-${AWS::Region}'
+        SourceEmailAddress: !Ref SourceEmailAddress
+        KnowledgeBaseId: !Ref KnowledgeBaseId
+      TimeoutInMinutes: 10
+    DependsOn:
+      - IamRolesStack
+
+  # Stack 3: Core Infrastructure (Now depends on Lambda to get its ARN for the trigger)
+  CoreInfrastructureStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplatesS3BucketName}.s3.${AWS::Region}.amazonaws.com/02-core-infra.yaml"
+      Parameters:
+        InitialProcessingLambdaArn: !GetAtt LambdaFunctionsStack.Outputs.InitialProcessingLambdaArn
+      TimeoutInMinutes: 5
+    DependsOn:
+      - LambdaFunctionsStack
+
+  # Stack 4: Step Functions State Machine
+  StepFunctionsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplatesS3BucketName}.s3.${AWS::Region}.amazonaws.com/04-step-functions.yaml"
+      Parameters:
+        StepFunctionsExecutionRoleArn: !GetAtt IamRolesStack.Outputs.StepFunctionsExecutionRoleArn
+        SimpleResponseLambdaArn: !GetAtt LambdaFunctionsStack.Outputs.SimpleResponseLambdaArn
+        RagResponseLambdaArn: !GetAtt LambdaFunctionsStack.Outputs.RagResponseLambdaArn
+        ClaimsAgentLambdaArn: !GetAtt LambdaFunctionsStack.Outputs.ClaimsAgentLambdaArn
+        EmailResponderLambdaArn: !GetAtt EmailResponderStack.Outputs.EmailResponderLambdaArn
+      TimeoutInMinutes: 5
+    DependsOn:
+      - IamRolesStack
+      - LambdaFunctionsStack
+
+  # Stack 5: Amazon SES Integration
+  SesIntegrationStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplatesS3BucketName}.s3.${AWS::Region}.amazonaws.com/05-ses-integration.yaml"
+      Parameters:
+        VerifiedEmail: !Ref VerifiedSesEmail
+        EmailS3BucketName: !Sub 'ai-email-demo-emails-${AWS::AccountId}-${AWS::Region}'
+      TimeoutInMinutes: 5
+    DependsOn:
+      - CoreInfrastructureStack
+  
+  # Stack 6: Quicksight Integration
+  AnalyticsIntegrationStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplatesS3BucketName}.s3.${AWS::Region}.amazonaws.com/06-analytics-pipeline.yaml"
+      Parameters:
+        DynamoDbStreamArn: !Ref DynamoDbStreamArn
+      TimeoutInMinutes: 5
+    DependsOn:
+      - CoreInfrastructureStack
+  
+  # Stack 7: Glue Crawler Integration
+  GlueCrawlerIntegrationStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplatesS3BucketName}.s3.${AWS::Region}.amazonaws.com/07-glue-catalog.yaml"
+      Parameters:
+        AnalyticsS3BucketName: !Sub 'ai-email-analytics-data-${AWS::AccountId}-${AWS::Region}'
+      TimeoutInMinutes: 5
+  
+  # Stack 8: Email responder
+  EmailResponderStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplatesS3BucketName}.s3.${AWS::Region}.amazonaws.com/08-reply-lambda.yaml"
+      Parameters:
+        SourceEmailAddress: !Ref VerifiedSesEmail
+      TimeoutInMinutes: 5
+
+  # Stack 9: Bedrock Knowledge Base (Must be created before Lambdas that use it)
+  BedrockKnowledgeBaseStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplatesS3BucketName}.s3.${AWS::Region}.amazonaws.com/09-bedrock-kb.yaml"
+      # Parameters:
+      #   FaqUrls: !Join [",", !Ref FaqUrlForKnowledgeBase]
+      TimeoutInMinutes: 20
+
+Outputs:
+  ResultsTableName:
+    Description: "Name of the DynamoDB table storing the email analysis results."
+    Value: !GetAtt CoreInfrastructureStack.Outputs.ResultsDynamoDbTableName
+  IncomingEmailBucket:
+    Description: "Name of the S3 bucket where incoming emails are stored."
+    Value: !GetAtt CoreInfrastructureStack.Outputs.EmailS3BucketName
+  StateMachineArn:
+    Description: "ARN of the Step Functions State Machine."
+    Value: !GetAtt StepFunctionsStack.Outputs.StateMachineArn
+  DemoEmailAddress:
+    Description: "Send emails to this address to trigger the workflow."
+    Value: !Ref VerifiedSesEmail
+

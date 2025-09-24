@@ -1,0 +1,119 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Deploys the dedicated Lambda function and IAM Role for sending automated email replies.
+
+Parameters:
+  SourceEmailAddress:
+    Type: String
+    Description: The email address verified in SES that will be used as the 'From' address for automated replies.
+
+Resources:
+  EmailResponderLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ai-email-demo-responder-lambda-role-${AWS::AccountId}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Email-Responder-Lambda-Permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                Resource: '*' # SES SendEmail action requires a wildcard resource
+
+  EmailResponderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'ai-email-responder-${AWS::AccountId}'
+      Handler: index.handler
+      Role: !GetAtt EmailResponderLambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 30
+      Environment:
+        Variables:
+          SOURCE_EMAIL: !Ref SourceEmailAddress
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import re
+
+          ses = boto3.client('ses')
+          SOURCE_EMAIL = os.environ['SOURCE_EMAIL']
+
+          def extract_email_address(from_header):
+              # A simple regex to extract an email address from a 'From' header
+              match = re.search(r'<(.+?)>', from_header)
+              if match:
+                  return match.group(1)
+              return from_header.strip()
+
+          def handler(event, context):
+              print(f"Email responder invoked with: {json.dumps(event)}")
+              
+              from_header = event.get('from')
+              if not from_header:
+                  print("No sender 'from' header found in event. Aborting.")
+                  return {"status": "Error", "reason": "No sender"}
+
+              original_sender = extract_email_address(from_header)
+              original_subject = event.get('subject', 'Your recent email')
+              email_domain = event.get('analysis', {}).get('domain', 'General')
+              
+              reply_subject = f"Re: {original_subject}"
+              
+              if email_domain == "Support":
+                  reply_body = (
+                      "Hello,\n\n"
+                      "Thank you for contacting our support team. We have received your request and an agent will be in touch with you shortly.\n\n"
+                      f"Your reference ID for this inquiry is: {event.get('messageId', 'N/A')}\n\n"
+                      "Best regards,\n"
+                      "The Support Team"
+                  )
+              elif email_domain == "Sales":
+                  reply_body = (
+                      "Hello,\n\n"
+                      "Thank you for your interest in our services. We have received your inquiry, and a member of our sales team will reach out to you within one business day.\n\n"
+                      "Best regards,\n"
+                      "The Sales Team"
+                  )
+              else:
+                  # For 'Claims' or 'General', we don't send a reply in this example
+                  print(f"Email domain is '{email_domain}'. No reply configured.")
+                  return {"status": "No reply sent", "domain": email_domain}
+
+              try:
+                  response = ses.send_email(
+                      Source=SOURCE_EMAIL,
+                      Destination={'ToAddresses': [original_sender]},
+                      Message={
+                          'Subject': {'Data': reply_subject},
+                          'Body': {'Text': {'Data': reply_body}}
+                      }
+                  )
+                  print(f"Successfully sent email to {original_sender}. Message ID: {response['MessageId']}")
+                  return {"status": "Success", "recipient": original_sender}
+              except Exception as e:
+                  print(f"Failed to send email to {original_sender}. Error: {str(e)}")
+                  # Re-raise the exception to make the Step Function task fail
+                  raise e
+
+Outputs:
+  EmailResponderLambdaArn:
+    Description: The ARN of the email responder Lambda function.
+    Value: !GetAtt EmailResponderFunction.Arn
