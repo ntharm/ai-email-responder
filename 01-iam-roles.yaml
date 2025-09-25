@@ -1,11 +1,16 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Creates all necessary IAM roles for the AI Email Management Demo.
+Description: >-
+  Creates all necessary IAM roles for the full AI Email Management Demo, 
+  including permissions for Textract, Bedrock KB, and SES.
 
 Resources:
+  # This is the primary execution role used by ALL Lambda functions in this solution.
+  # It grants a consolidated set of permissions for all required actions.
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub 'ai-email-demo-lambda-role-${AWS::AccountId}-${AWS::Region}'
+      # This policy allows the AWS Lambda service to assume this role.
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -18,25 +23,105 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
+              # [Logging] Allows functions to write logs to Amazon CloudWatch.
               - Effect: Allow
                 Action:
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: 'arn:aws:logs:*:*:*'
+              # [S3 Access] Allows the InitialProcessingFunction to read raw emails and save attachments.
               - Effect: Allow
                 Action:
                   - s3:GetObject
+                  - s3:PutObject
                 Resource: !Sub 'arn:aws:s3:::ai-email-demo-emails-${AWS::AccountId}-${AWS::Region}/*'
+              # [DynamoDB Access] Allows functions to write/update the results in the DynamoDB table.
               - Effect: Allow
                 Action:
                   - dynamodb:PutItem
+                  - dynamodb:UpdateItem
                 Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/ai-email-demo-results-${AWS::AccountId}'
+              # [Step Functions] Allows the InitialProcessingFunction to start the state machine execution.
               - Effect: Allow
                 Action:
                   - states:StartExecution
                 Resource: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:AI-Email-Orchestrator-${AWS::AccountId}'
-              # CHANGE: Updated the model ARN to grant access to the new Claude 3 Sonnet model.
+              # [Bedrock Classification] Allows the InitialProcessingFunction to call the Claude 3 model for analysis.
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0'
+              # [Bedrock Knowledge Base] Allows access to knowledge base operations
+              - Effect: Allow
+                Action:
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*'
+              # [Bedrock Agent Runtime] Allows the RagResponseLambda to query the Knowledge Base via Agent Runtime
+              - Effect: Allow
+                Action:
+                  - bedrock-agent:RetrieveAndGenerate
+                  - bedrock-agent:Retrieve
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*'
+              # [SES Replies] Allows the RagResponseLambda to send email replies.
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                Resource: '*'
+              # [Textract OCR] Allows the AttachmentProcessorLambda to analyze documents.
+              - Effect: Allow
+                Action:
+                  - textract:AnalyzeDocument
+                Resource: '*'
+
+  # This is the execution role used by the Step Functions state machine.
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ai-email-demo-sfn-role-${AWS::AccountId}-${AWS::Region}'
+      # This policy allows the AWS Step Functions service to assume this role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AI-Email-Demo-StepFunctions-Permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # [Invoke Lambdas] Allows the state machine to invoke any Lambda function prefixed with 'ai-email-'.
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:ai-email-*'
+
+  # 3. IAM Role for the Knowledge Base
+  BedrockKnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ai-email-demo-bedrock-kb-role-${AWS::AccountId}-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Bedrock-KB-Bedrock-Model-Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: "bedrock:InvokeModel"
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v1'
+              - Effect: Allow
+                Action: "bedrock:InvokeModel"
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0'
               - Effect: Allow
                 Action: bedrock:InvokeModel
                 Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0'
@@ -50,31 +135,18 @@ Resources:
               - Effect: Allow
                 Action: ses:SendEmail
                 Resource: '*' # For this demo, we allow sending to any recipient.
-
-  StepFunctionsExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub 'ai-email-demo-sfn-role-${AWS::AccountId}-${AWS::Region}'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: states.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: AI-Email-Demo-StepFunctions-Permissions
+        - PolicyName: Bedrock-KB-OpenSearch-Access
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action:
-                  - lambda:InvokeFunction
-                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:ai-email-*'
+                Action: 
+                  - "aoss:APIAccessAll"
+                  - "aoss:DashboardsAccessAll"
+                Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
 
 Outputs:
   LambdaExecutionRoleArn:
     Value: !GetAtt LambdaExecutionRole.Arn
   StepFunctionsExecutionRoleArn:
     Value: !GetAtt StepFunctionsExecutionRole.Arn
-
