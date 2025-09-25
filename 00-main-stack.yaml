@@ -60,6 +60,8 @@ Resources:
       TemplateURL: !Sub "https://${TemplatesS3BucketName}.s3.${AWS::Region}.amazonaws.com/02-core-infra.yaml"
       Parameters:
         InitialProcessingLambdaArn: !GetAtt LambdaFunctionsStack.Outputs.InitialProcessingLambdaArn
+        AttachmentOcrLambdaArn: !GetAtt LambdaEmailAttachmentStack.Outputs.AttachmentOcrFunctionArn
+        ResultsDynamoDbTableName: !Sub 'ai-email-demo-results-${AWS::AccountId}'
       TimeoutInMinutes: 5
     DependsOn:
       - LambdaFunctionsStack
@@ -120,15 +122,16 @@ Resources:
       Parameters:
         SourceEmailAddress: !Ref VerifiedSesEmail
       TimeoutInMinutes: 5
-
-  # Stack 9: Bedrock Knowledge Base (Must be created before Lambdas that use it)
-  BedrockKnowledgeBaseStack:
+  
+  # Stack 9: Lambda to process email attachedments with Textract. 
+  LambdaEmailAttachmentStack:
     Type: AWS::CloudFormation::Stack
     Properties:
-      TemplateURL: !Sub "https://${TemplatesS3BucketName}.s3.${AWS::Region}.amazonaws.com/09-bedrock-kb.yaml"
-      # Parameters:
-      #   FaqUrls: !Join [",", !Ref FaqUrlForKnowledgeBase]
-      TimeoutInMinutes: 20
+      TemplateURL: !Sub "https://${TemplatesS3BucketName}.s3.${AWS::Region}.amazonaws.com/09-email-attachment-process.yaml"
+      Parameters:
+        LambdaExecutionRoleArn: !GetAtt IamRolesStack.Outputs.LambdaExecutionRoleArn
+        ResultsDynamoDbTableName: !Sub 'ai-email-demo-results-${AWS::AccountId}'
+      TimeoutInMinutes: 10
 
 Outputs:
   ResultsTableName:

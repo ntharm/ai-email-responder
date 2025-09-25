@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Deploys all Lambda functions, including the updated RAG responder that uses the Knowledge Base.
+Description: Deploys all Lambda functions, including the updated RAG responder and new attachment handling logic.
 
 Parameters:
   LambdaExecutionRoleArn:
@@ -7,7 +7,7 @@ Parameters:
     Description: IAM role ARN assumed by all Lambdas in this stack.
   EmailS3BucketName:
     Type: String
-    Description: S3 bucket where inbound emails are stored.
+    Description: S3 bucket where inbound emails and attachments are stored.
   ResultsDynamoDbTableName:
     Type: String
     Description: DynamoDB table to store processing results.
@@ -36,6 +36,7 @@ Resources:
         Variables:
           DYNAMODB_TABLE: !Ref ResultsDynamoDbTableName
           STATE_MACHINE_ARN: !Ref StateMachineArn
+          S3_BUCKET_NAME: !Ref EmailS3BucketName
       Code:
         ZipFile: |
           import boto3
@@ -63,6 +64,7 @@ Resources:
 
           DYNAMODB_TABLE = os.environ['DYNAMODB_TABLE']
           STATE_MACHINE_ARN = os.environ['STATE_MACHINE_ARN']
+          S3_BUCKET_NAME = os.environ['S3_BUCKET_NAME']
 
           def clean_empty_strings(d):
               if isinstance(d, dict):
@@ -71,16 +73,31 @@ Resources:
                   return [clean_empty_strings(i) for i in d if i is not None and i != '']
               return d
 
-          def get_email_body(msg):
+          def get_email_body_and_attachments(msg, message_id):
+              body = ""
+              attachments = []
+              
               if msg.is_multipart():
                   for part in msg.walk():
-                      ctype = part.get_content_type()
-                      cdispo = str(part.get('Content-Disposition'))
-                      if ctype == 'text/plain' and 'attachment' not in cdispo:
-                          return part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                      filename = part.get_filename()
+                      if filename:
+                          attachment_key = f"attachments/{message_id}/{filename}"
+                          try:
+                              s3.put_object(
+                                  Bucket=S3_BUCKET_NAME,
+                                  Key=attachment_key,
+                                  Body=part.get_payload(decode=True)
+                              )
+                              attachments.append(filename)
+                              print(f"SUCCESS: Saved attachment '{filename}' to S3 key: {attachment_key}")
+                          except Exception as e:
+                              print(f"ERROR: Could not save attachment '{filename}'. Reason: {e}")
+                      elif part.get_content_type() == 'text/plain':
+                          body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
               else:
-                  return msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-              return ""
+                  body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+
+              return body, attachments
 
           def handler(event, context):
               print(f"Received event: {json.dumps(event)}")
@@ -96,11 +113,20 @@ Resources:
 
                   subject = msg.get('Subject', 'No Subject')
                   from_email = msg.get('From', 'No Sender')
-                  body = get_email_body(msg)
-                  message_id = msg.get('Message-ID', str(uuid.uuid4()))
+                  message_id = msg.get('Message-ID', str(uuid.uuid4())).strip('<>')
+                  
+                  body, attachment_names = get_email_body_and_attachments(msg, message_id)
 
                   print(f"Processing email: From='{from_email}', Subject='{subject}'")
+                  if attachment_names:
+                      print(f"Found and saved attachments: {', '.join(attachment_names)}")
 
+                  system_prompt = (
+                      # ... (your existing prompt is here)
+                  )
+                  # ... (your existing user_prompt construction is here)
+                  
+                  # --- The rest of the handler logic ---
                   system_prompt = (
                       "You are an expert email analysis agent for a health insurance company. "
                       "Your task is to analyze an email and return a structured JSON object. "
@@ -148,16 +174,27 @@ Resources:
                       accept='application/json',
                       contentType='application/json'
                   )
-
+                  
                   response_body_str = bedrock_response['body'].read().decode('utf-8')
                   response_json = json.loads(response_body_str)
                   analysis_str = response_json['content'][0]['text']
-                  analysis = json.loads(analysis_str)
-
-                  print(f"Bedrock analysis complete: {json.dumps(analysis)}")
-
+                  
+                  # FIX: Add a try/except block to gracefully handle empty or invalid JSON from Bedrock
+                  try:
+                      analysis = json.loads(analysis_str)
+                      print(f"Bedrock analysis complete: {json.dumps(analysis)}")
+                  except json.JSONDecodeError:
+                      print(f"WARNING: Bedrock returned a non-JSON response: '{analysis_str}'. Defaulting to 'General' domain.")
+                      analysis = {
+                          "domain": "General",
+                          "intent": "Uncategorized",
+                          "sentiment": "Neutral",
+                          "summary": "AI analysis failed due to an invalid model response. Email requires manual review.",
+                          "entities": {}
+                      }
+                  
                   domain = analysis.get('domain', 'General')
-
+                  
                   item_to_save = {
                       'messageId': {'S': message_id},
                       'receivedTimestamp': {'S': datetime.datetime.utcnow().isoformat()},
@@ -165,7 +202,8 @@ Resources:
                       'subject': {'S': subject},
                       'body': {'S': body},
                       'status': {'S': f'Completed-{domain}'},
-                      'analysis': {'S': json.dumps(analysis)}
+                      'analysis': {'S': json.dumps(analysis)},
+                      'attachments': {'SS': attachment_names} if attachment_names else {'NULL': True}
                   }
 
                   stepfunctions_input = {
@@ -180,10 +218,10 @@ Resources:
                       stateMachineArn=STATE_MACHINE_ARN,
                       input=json.dumps(stepfunctions_input, cls=DecimalEncoder)
                   )
-
+                  
                   sanitized_item = clean_empty_strings(item_to_save)
                   dynamodb.put_item(TableName=DYNAMODB_TABLE, Item=sanitized_item)
-
+                  
                   return {'statusCode': 200, 'body': json.dumps('Email processed successfully!')}
 
               except Exception as e:
@@ -194,6 +232,9 @@ Resources:
                   }
                   dynamodb.put_item(TableName=DYNAMODB_TABLE, Item=error_item)
                   raise e
+
+  # ... (rest of your Lambda functions are correct)
+  # (SimpleResponseLambda, RagResponseLambda, ClaimsAgentLambda)
 
   SimpleResponseLambda:
     Type: AWS::Lambda::Function
@@ -295,10 +336,10 @@ Resources:
                   if is_unhelpful_answer:
                       print("Knowledge Base did not provide a confident answer. Sending generic reply.")
                       reply_body = (
-                          "Hello,\n"
+                          "Hello,\n\n"
                           "Thank you for your inquiry.\n\n"
                           "We are currently reviewing your question, and a member of our team will be in touch with you shortly.\n\n"
-                          f"Best regards,\n\n{team_name}\n"
+                          f"Best regards,\n{team_name}"
                       )
                   else:
                       print(f"Generated answer: {generated_answer}")
@@ -307,8 +348,7 @@ Resources:
                           "\nThank you for your question. Here is some information that might help:\n",
                           generated_answer,
                           "\nIf this does not fully answer your question, one of our agents will be in touch shortly.",
-                          "\nBest regards,\n",
-                          team_name
+                          f"\nBest regards,\n{team_name}"
                       ]
                       if citations:
                           parts.append("\n\nSource(s):")
@@ -348,7 +388,7 @@ Resources:
           import json
 
           def handler(event, context):
-              print(f"Claims agent invoked with: {json.dumps(event)}")
+              print(f"Simple responder invoked with: {json.dumps(event)}")
               return {"status": "Handled by claims agent"}
 
 Outputs:

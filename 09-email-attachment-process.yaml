@@ -1,0 +1,102 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Deploys the Lambda function responsible for processing email attachments using Amazon Textract.
+
+Parameters:
+  LambdaExecutionRoleArn:
+    Type: String
+    Description: The ARN of the IAM role for the Lambda function.
+  ResultsDynamoDbTableName:
+    Type: String
+    Description: The name of the DynamoDB table where OCR results will be stored.
+
+Resources:
+  AttachmentOcrFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'ai-email-attachment-processor-${AWS::AccountId}'
+      Handler: index.handler
+      Role: !Ref LambdaExecutionRoleArn
+      Runtime: python3.11
+      Timeout: 180 # Increased timeout for potentially large documents
+      MemorySize: 512
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref ResultsDynamoDbTableName
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import urllib.parse
+
+          s3 = boto3.client('s3')
+          textract = boto3.client('textract')
+          dynamodb = boto3.client('dynamodb')
+
+          DYNAMODB_TABLE = os.environ['DYNAMODB_TABLE']
+
+          def handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+              
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'])
+              
+              # The key is expected to be in the format: attachments/message_id/filename
+              try:
+                  parts = key.split('/')
+                  if len(parts) != 3 or parts[0] != 'attachments':
+                      print(f"Object key '{key}' is not in the expected format 'attachments/message_id/filename'. Skipping.")
+                      return
+                  
+                  message_id = parts[1]
+                  filename = parts[2]
+                  
+                  print(f"Processing attachment '{filename}' for messageId '{message_id}' from bucket '{bucket}'.")
+
+                  # Call Textract to analyze the document
+                  response = textract.analyze_document(
+                      Document={'S3Object': {'Bucket': bucket, 'Name': key}},
+                      FeatureTypes=['FORMS'] # Use FORMS or TABLES for structured data
+                  )
+                  
+                  # Extract the raw text from the Textract response
+                  extracted_text = ""
+                  for block in response['Blocks']:
+                      if block['BlockType'] == 'LINE':
+                          extracted_text += block['Text'] + '\n'
+                  
+                  if not extracted_text:
+                      print("No text was extracted from the document.")
+                      extracted_text = "OCR processing complete, but no text was found."
+
+                  # Update the DynamoDB item with the extracted text
+                  dynamodb.update_item(
+                      TableName=DYNAMODB_TABLE,
+                      Key={'messageId': {'S': message_id}},
+                      UpdateExpression="SET attachment_text = :text, attachment_filename = :fname",
+                      ExpressionAttributeValues={
+                          ':text': {'S': extracted_text},
+                          ':fname': {'S': filename}
+                      }
+                  )
+                  
+                  print(f"Successfully updated DynamoDB item for messageId '{message_id}' with extracted text.")
+                  return {'statusCode': 200, 'body': json.dumps('Attachment processed successfully!')}
+
+              except Exception as e:
+                  print(f"Error processing attachment {key}: {e}")
+                  # Optionally, update DynamoDB with an error message
+                  message_id_from_key = key.split('/')[1] if '/' in key else key
+                  dynamodb.update_item(
+                      TableName=DYNAMODB_TABLE,
+                      Key={'messageId': {'S': message_id_from_key}},
+                      UpdateExpression="SET attachment_error = :error",
+                      ExpressionAttributeValues={':error': {'S': str(e)}}
+                  )
+                  raise e
+
+Outputs:
+  AttachmentOcrFunctionArn:
+    Description: The ARN of the attachment processor Lambda function.
+    Value: !GetAtt AttachmentOcrFunction.Arn

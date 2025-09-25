@@ -1,29 +1,46 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Creates the S3 bucket, DynamoDB table, and the S3-to-Lambda trigger.
+Description: >-
+  Creates the core infrastructure: S3 bucket for emails, DynamoDB table for results,
+  and the S3 event triggers for both initial processing and attachment OCR.
 
 Parameters:
   InitialProcessingLambdaArn:
     Type: String
-    Description: The ARN of the Lambda function that will be triggered by S3.
+    Description: The ARN of the Lambda function that will be triggered by new emails.
+  AttachmentOcrLambdaArn:
+    Type: String
+    Description: The ARN of the Lambda function that will be triggered by new attachments.
+  ResultsDynamoDbTableName:
+    Type: String
+    Description: The name for the DynamoDB table that will store the results.
 
 Resources:
-  # This permission MUST be created before the bucket tries to use it.
-  S3InvokeLambdaPermission:
+  # These permissions are created first, using a predictable bucket ARN to break dependency loops.
+  S3InvokeInitialLambdaPermission:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref InitialProcessingLambdaArn
       Action: lambda:InvokeFunction
       Principal: s3.amazonaws.com
-      # We construct the ARN manually from a predictable bucket name to break the circular dependency.
+      SourceArn: !Sub 'arn:aws:s3:::ai-email-demo-emails-${AWS::AccountId}-${AWS::Region}'
+      SourceAccount: !Ref AWS::AccountId
+
+  S3InvokeAttachmentLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AttachmentOcrLambdaArn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
       SourceArn: !Sub 'arn:aws:s3:::ai-email-demo-emails-${AWS::AccountId}-${AWS::Region}'
       SourceAccount: !Ref AWS::AccountId
 
   EmailS3Bucket:
     Type: AWS::S3::Bucket
-    # This explicit dependency ensures the permission exists before the trigger is configured.
-    DependsOn: S3InvokeLambdaPermission
+    # This bucket waits until the Lambda permissions are fully created before configuring itself.
+    DependsOn:
+      - S3InvokeInitialLambdaPermission
+      - S3InvokeAttachmentLambdaPermission
     Properties:
-      # We define a predictable, globally unique bucket name to use in the permission's SourceArn.
       BucketName: !Sub 'ai-email-demo-emails-${AWS::AccountId}-${AWS::Region}'
       BucketEncryption:
         ServerSideEncryptionConfiguration:
@@ -41,6 +58,7 @@ Resources:
             ExpirationInDays: 7
       NotificationConfiguration:
         LambdaConfigurations:
+          # Trigger 1: For new emails in the 'incoming-emails/' prefix.
           - Event: 's3:ObjectCreated:*'
             Function: !Ref InitialProcessingLambdaArn
             Filter:
@@ -48,11 +66,19 @@ Resources:
                 Rules:
                   - Name: prefix
                     Value: incoming-emails/
+          # Trigger 2: For new attachments in the 'attachments/' prefix.
+          - Event: 's3:ObjectCreated:*'
+            Function: !Ref AttachmentOcrLambdaArn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: attachments/
 
   EmailS3BucketPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
-      Bucket: !Ref EmailS3Bucket
+      Bucket: !Sub 'ai-email-demo-emails-${AWS::AccountId}-${AWS::Region}' # Uses predictable name to break dependency
       PolicyDocument:
         Statement:
           - Sid: AllowSESPuts
@@ -60,7 +86,7 @@ Resources:
             Principal:
               Service: ses.amazonaws.com
             Action: s3:PutObject
-            Resource: !Sub 'arn:aws:s3:::${EmailS3Bucket}/*'
+            Resource: !Sub 'arn:aws:s3:::ai-email-demo-emails-${AWS::AccountId}-${AWS::Region}/*'
             Condition:
               StringEquals:
                 'aws:Referer': !Ref AWS::AccountId
@@ -75,13 +101,17 @@ Resources:
         - AttributeName: messageId
           KeyType: HASH
       BillingMode: PAY_PER_REQUEST
-      TableName: !Sub 'ai-email-demo-results-${AWS::AccountId}'
+      TableName: !Ref ResultsDynamoDbTableName
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
 
 Outputs:
   EmailS3BucketName:
-    Description: Name of the S3 bucket for storing emails.
+    Description: Name of the S3 bucket for storing emails and attachments.
     Value: !Ref EmailS3Bucket
   ResultsDynamoDbTableName:
     Description: Name of the DynamoDB table for storing results.
     Value: !Ref ResultsDynamoDbTable
-
+  DynamoDbStreamArn:
+    Description: ARN of the DynamoDB stream for the results table.
+    Value: !GetAtt ResultsDynamoDbTable.StreamArn
